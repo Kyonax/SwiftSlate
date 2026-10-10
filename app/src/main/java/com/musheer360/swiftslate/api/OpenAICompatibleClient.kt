@@ -15,6 +15,31 @@ class OpenAICompatibleClient {
 
     companion object {
         private val HTTP_PREFIX_REGEX = Regex("^HTTP_\\d+:\\s*")
+
+        /** Version header Anthropic's native endpoints (e.g. GET /v1/models) require. */
+        internal const val ANTHROPIC_VERSION = "2023-06-01"
+
+        /** Whether [url] points at Anthropic's API (api.anthropic.com or a subdomain). */
+        internal fun isAnthropic(url: URL): Boolean {
+            val host = url.host?.lowercase()?.removeSuffix(".") ?: return false
+            return host == "anthropic.com" || host.endsWith(".anthropic.com")
+        }
+
+        /**
+         * Sets auth headers for a GET against a models-list path. Anthropic serves
+         * /v1/models natively, so it wants `x-api-key` + `anthropic-version` instead of the
+         * OpenAI-style Bearer token (it answers 400 "anthropic-version: header is required"
+         * otherwise). Everything else keeps the Bearer header.
+         */
+        internal fun HttpURLConnection.applyModelsAuth(apiKey: String?) {
+            if (apiKey.isNullOrBlank()) return
+            if (isAnthropic(url)) {
+                setRequestProperty("x-api-key", apiKey)
+                setRequestProperty("anthropic-version", ANTHROPIC_VERSION)
+            } else {
+                setRequestProperty("Authorization", "Bearer $apiKey")
+            }
+        }
     }
 
     suspend fun validateKey(apiKey: String, endpoint: String): Result<String> = withContext(Dispatchers.IO) {
@@ -27,7 +52,7 @@ class OpenAICompatibleClient {
             connection = URL("$baseUrl/models")
                 .openConnection() as HttpURLConnection
             connection.requestMethod = "GET"
-            connection.setRequestProperty("Authorization", "Bearer $apiKey")
+            connection.applyModelsAuth(apiKey)
             connection.connectTimeout = 15_000
             connection.readTimeout = 15_000
 
@@ -88,7 +113,7 @@ class OpenAICompatibleClient {
         return try {
             probe = URL(url).openConnection() as HttpURLConnection
             probe.requestMethod = "GET"
-            probe.setRequestProperty("Authorization", "Bearer $apiKey")
+            probe.applyModelsAuth(apiKey)
             probe.connectTimeout = 15_000
             probe.readTimeout = 15_000
             val code = probe.responseCode
@@ -178,9 +203,7 @@ class OpenAICompatibleClient {
         return try {
             connection = URL(url).openConnection() as HttpURLConnection
             connection.requestMethod = "GET"
-            if (!apiKey.isNullOrBlank()) {
-                connection.setRequestProperty("Authorization", "Bearer $apiKey")
-            }
+            connection.applyModelsAuth(apiKey)
             connection.connectTimeout = 15_000
             connection.readTimeout = 15_000
             val code = connection.responseCode
@@ -240,8 +263,9 @@ class OpenAICompatibleClient {
         var connection: HttpURLConnection? = null
         return try {
             val baseUrl = endpoint.trimEnd('/')
-            connection = URL("$baseUrl/chat/completions")
-                .openConnection() as HttpURLConnection
+            val chatUrl = URL("$baseUrl/chat/completions")
+            val anthropic = isAnthropic(chatUrl)
+            connection = chatUrl.openConnection() as HttpURLConnection
             connection.requestMethod = "POST"
             connection.setRequestProperty("Content-Type", "application/json")
             connection.setRequestProperty("Authorization", "Bearer $apiKey")
@@ -268,7 +292,9 @@ class OpenAICompatibleClient {
                         put("content", ApiClientUtils.wrapUserText(text))
                     })
                 })
-                put("temperature", temperature)
+                // Current Claude models reject any temperature below 1 through Anthropic's
+                // OpenAI-compatible layer (400), so leave it at the server default there.
+                if (!anthropic) put("temperature", temperature)
                 if (withJsonObject) {
                     put("response_format", JSONObject().apply {
                         put("type", "json_object")
